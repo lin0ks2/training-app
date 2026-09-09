@@ -14,6 +14,9 @@
   const MAX_UNIQUE = 25;
   const TARGET_CONTACTS = 35;
   const COMPLETED_DATE_KEY = 'mm.daily.completedDate';
+  const COMPLETED_BY_LANG_KEY = 'mm.daily.completedByLang.v1';
+  const STARTER_SESSION_LIMIT = 5;
+  const STARTER_PROGRESS_CEILING = 60;
 
   function localDateKey(){
     const d=new Date();
@@ -27,6 +30,30 @@
   }
   function markCompletedToday(){
     try{ localStorage.setItem(COMPLETED_DATE_KEY,localDateKey()); }catch(_){}
+  }
+  function completedByLang(){
+    try{
+      const raw=localStorage.getItem(COMPLETED_BY_LANG_KEY);
+      const parsed=raw?JSON.parse(raw):{};
+      return parsed&&typeof parsed==='object'&&!Array.isArray(parsed)?parsed:{};
+    }catch(_){ return {}; }
+  }
+  function completedCount(lg){
+    const n=Number(completedByLang()[String(lg||'').toLowerCase()]||0);
+    return Number.isFinite(n)&&n>0?Math.floor(n):0;
+  }
+  function markCompletedForLang(lg){
+    try{
+      const key=String(lg||'').toLowerCase();
+      if(!key) return;
+      const db=completedByLang();
+      db[key]=completedCount(key)+1;
+      localStorage.setItem(COMPLETED_BY_LANG_KEY,JSON.stringify(db));
+    }catch(_){}
+  }
+  function starterStage(lg,started){
+    const count=completedCount(lg);
+    return count<STARTER_SESSION_LIMIT && Number(started||0)<STARTER_PROGRESS_CEILING ? count : -1;
   }
   const MAX_CONTACTS = 42;
   let active = null;
@@ -106,6 +133,59 @@
   function expectedContacts(plan){
     return (Number(plan.review||0)) + 2*(Number(plan.newWords||0)+Number(plan.mistakes||0));
   }
+  function levelRank(w){
+    const raw=String((w&&w.level)||'').trim().toUpperCase();
+    const m=raw.match(/^([ABC])(\d)$/);
+    if(!m) return 99;
+    return ({A:0,B:10,C:20}[m[1]]||0)+Number(m[2]||0);
+  }
+  function posOfKey(key){
+    const m=String(key||'').match(/^[a-z]{2}_(nouns|verbs|adjectives|adverbs|pronouns|prepositions|conjunctions|particles|numbers)$/i);
+    return m?m[1].toLowerCase():'other';
+  }
+  function starterFreshPool(fresh,stage,limit){
+    const src=fresh.slice();
+    const hasLevels=src.some(x=>x&&x.w&&String(x.w.level||'').trim());
+    let preferred=src;
+    if(hasLevels){
+      if(stage<=1){
+        const a1=src.filter(x=>levelRank(x.w)===1);
+        preferred=a1.length>=Math.min(limit,6)?a1:src.slice().sort((a,b)=>levelRank(a.w)-levelRank(b.w));
+      }else{
+        const a1=src.filter(x=>levelRank(x.w)===1);
+        const a2=src.filter(x=>levelRank(x.w)===2);
+        preferred=[...a1,...a2];
+        if(preferred.length<limit){
+          const used=new Set(preferred);
+          preferred.push(...src.filter(x=>!used.has(x)).sort((a,b)=>levelRank(a.w)-levelRank(b.w)));
+        }
+      }
+    }
+
+    const byPos=new Map();
+    preferred.forEach(x=>{
+      const pos=posOfKey(x.key);
+      if(!byPos.has(pos)) byPos.set(pos,[]);
+      byPos.get(pos).push(x);
+    });
+
+    const templates=stage<=1
+      ? ['nouns','verbs','adjectives','pronouns','numbers','nouns','verbs','adjectives','nouns','numbers','verbs','nouns']
+      : ['nouns','verbs','adjectives','pronouns','numbers','adverbs','nouns','verbs','prepositions','adjectives'];
+    const out=[]; const used=new Set();
+    for(const pos of templates){
+      if(out.length>=limit) break;
+      const bucket=byPos.get(pos)||[];
+      const x=bucket.find(v=>!used.has(v));
+      if(x){ used.add(x); out.push(x); }
+    }
+    for(const x of preferred){
+      if(out.length>=limit) break;
+      if(used.has(x)) continue;
+      used.add(x); out.push(x);
+    }
+    return out.slice(0,limit);
+  }
 
   /*
    * Daily quota is based on expected answer contacts rather than only unique
@@ -143,14 +223,21 @@
     // 5-star words remain valid review material (oldest first in build()).
     // This prevents Daily Session from shrinking to zero after a deck is mastered.
     const reviewAvail=Math.max(0,started);
+    const starter=starterStage(lg,started);
 
     let m=Math.min(5,mistakes);
     let n=0;
     if(newAvail>0){
-      // Daily should feel like a real short lesson, not a 10-click checklist.
-      // Established learners get 7–8 fresh words; a brand-new learner gets 15.
-      n=Math.min(newAvail, started===0 ? 15 : 8);
-      if(started>0) n=Math.max(Math.min(7,newAvail),n);
+      if(starter>=0){
+        // First Daily sessions for a new language introduce fewer fresh cards.
+        // The build step will spread them across several parts of speech and
+        // prefer the lowest CEFR material instead of continuing lastDeck.
+        n=Math.min(newAvail, starter<=1 ? (started===0 ? 12 : 10) : 8);
+      }else{
+        // Normal adaptive Daily behaviour for an established language.
+        n=Math.min(newAvail, started===0 ? 15 : 8);
+        if(started>0) n=Math.max(Math.min(7,newAvail),n);
+      }
     }
 
     let contacts=2*(m+n);
@@ -169,15 +256,15 @@
 
     // Brand-new/small dictionaries should not be padded artificially.
     if(started===0 && mistakes===0 && newAvail>0){
-      m=0; r=0; n=Math.min(15,newAvail); contacts=2*n;
+      m=0; r=0; n=Math.min(starter>=0?12:15,newAvail); contacts=2*n;
     }
 
     let unique=Math.min(MAX_UNIQUE,m+n+r);
-    if(unique===0 && total>0){ n=Math.min(15,total); unique=n; contacts=2*n; }
+    if(unique===0 && total>0){ n=Math.min(starter>=0?12:15,total); unique=n; contacts=2*n; }
     const minutes=Math.max(3,Math.round(contacts*0.17));
     return {
       lang:lg,review:r,newWords:n,mistakes:m,total:unique,
-      expectedContacts:contacts,minutes,learned
+      expectedContacts:contacts,minutes,learned,starterStage:starter
     };
   }
 
@@ -215,13 +302,19 @@
     reviews.sort((a,b)=>(Number(a.mastered)-Number(b.mastered))||(a.last-b.last)||(a.s-b.s));
     fresh.sort((a,b)=>((a.key===last?-1:0)-(b.key===last?-1:0))||(a.last-b.last));
 
+    const selectedFresh=plan.starterStage>=0
+      ? starterFreshPool(fresh,plan.starterStage,plan.newWords)
+      : fresh.slice(0,plan.newWords);
+    const selectedFreshSet=new Set(selectedFresh);
+
     const out=[]; const seen=new Set();
     shuffle(mistakes.slice(0,Math.max(plan.mistakes,8))).slice(0,plan.mistakes).forEach(x=>uniquePush(out,seen,cloneForDaily(x.w,x.key,'mistake')));
     reviews.slice(0,plan.review).forEach(x=>uniquePush(out,seen,cloneForDaily(x.w,x.key,'review')));
-    fresh.slice(0,plan.newWords).forEach(x=>uniquePush(out,seen,cloneForDaily(x.w,x.key,'new')));
+    selectedFresh.forEach(x=>uniquePush(out,seen,cloneForDaily(x.w,x.key,'new')));
 
     // Fill only if metadata under-estimated availability; respect the compact ceiling.
-    const fill=[...reviews.slice(plan.review),...fresh.slice(plan.newWords),...mistakes.slice(plan.mistakes)];
+    const remainingFresh=fresh.filter(x=>!selectedFreshSet.has(x));
+    const fill=[...reviews.slice(plan.review),...remainingFresh,...mistakes.slice(plan.mistakes)];
     const wanted=Math.min(MAX_UNIQUE,Math.max(out.length,plan.total));
     for(const x of fill){
       if(out.length>=wanted) break;
@@ -393,6 +486,7 @@
       elapsedMinutes:Math.max(1,Math.ceil(Math.max(0,Date.now()-Number(old.startedAt||Date.now()))/60000))
     });
     markCompletedToday();
+    markCompletedForLang(old.plan&&old.plan.lang);
     try{ if(A.Trainer&&typeof A.Trainer.setDeckKey==='function'&&old.returnKey) A.Trainer.setDeckKey(old.returnKey,{silent:true}); }catch(_){}
     try{ document.dispatchEvent(new CustomEvent('lexitron:daily-finish',{detail:result})); }catch(_){}
     return result;
